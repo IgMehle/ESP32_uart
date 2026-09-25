@@ -1,8 +1,8 @@
-#include "driver/uart.h"
-#include "hal/uart_ll.h"
-#include "soc/uart_struct.h"
-#include "driver/uart.h"
+#include "driver/uart.h"   // uart_isr_register, uart_enable_tx_intr, etc.
+#include "hal/uart_ll.h"   // uart_ll_*, uart_dev_t
+#include "soc/uart_struct.h" // UART0, UART1, UART2
 #include "esp_intr_alloc.h"
+#include "soc/interrupts.h"    // ETS_UARTn_INTR_SOURCE
 
 // PINOUT
 #define UART0_TX_PIN  17
@@ -77,10 +77,19 @@ volatile ring_buffer_t tx_buffer;
 volatile uint8_t flag_new_line = 0;
 
 // Handle de las ISR
-static intr_handle_t uart0_isr_handle;
-static intr_handle_t uart1_isr_handle;
-static intr_handle_t uart2_isr_handle;
+//static intr_handle_t uart0_isr_handle;
+//static intr_handle_t uart1_isr_handle;
+//static intr_handle_t uart2_isr_handle;
 static intr_handle_t uart_isr_handle[3];
+
+static const int uart_intr_src[] = {
+    ETS_UART0_INTR_SOURCE,   // [0]
+    ETS_UART1_INTR_SOURCE,   // [1]
+    ETS_UART2_INTR_SOURCE    // [2]
+};
+
+// CALLBACK ISR
+//void IRAM_ATTR ISR_uart0(void *arg);
 
 void uart_init(uart_handle_t uart, uint32_t baudrate)
 {
@@ -97,52 +106,6 @@ void uart_init(uart_handle_t uart, uint32_t baudrate)
     // mapeo GPIO a signals de la UART
     uart_set_pin(uart, UART0_TX_PIN, UART0_RX_PIN,
                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-}
-
-// Registro del ISR (la parte más diferente)
-
-// En el LPC845 el ISR es un símbolo débil que el linker resuelve automáticamente. 
-// En ESP-IDF hay que registrarlo explícitamente, y hay una restricción importante: 
-// uart_isr_register() no puede usarse si antes llamaste a uart_driver_install() 
-// — son mutuamente excluyentes.
-void uart_enable_irq(uart_handle_t uart)
-{
-    // Habilito RX interrupts a nivel de periférico
-    // (RXFIFO_FULL + RXFIFO_TOUT, análogo a kUSART_RxReadyInterruptEnable)
-    
-    // El primer argumento de todas las funciones uart_ll_* es uart_dev_t *hw: 
-    // en la práctica se usa &UART0, &UART1 o &UART2 (instancias globales del SDK).
-    uart_dev_t *uart_n = get_uart_instance(uart);
-
-    uart_ll_ena_intr_mask(uart_n,
-        UART_INTR_RXFIFO_FULL | UART_INTR_RXFIFO_TOUT);
-
-    // Registro ISR + habilito en el controlador de interrupciones del Xtensa
-    // Análogo a NVIC_EnableIRQ(USART0_IRQn)
-    // ESP_INTR_FLAG_IRAM → handler en IRAM, seguro ante cache miss de flash
-    
-    // UART0
-    uart_isr_register(uart,
-                      ISR_uart0,   // CALLBACK a asignar
-                      NULL,
-                      ESP_INTR_FLAG_IRAM,
-                      &uart_isr_handle[uart]);
-    /*
-    // UART1
-    uart_isr_register(uart,
-                      ISR_uart1,   // CALLBACK a asignar
-                      NULL,
-                      ESP_INTR_FLAG_IRAM,
-                      &uart_isr_handle[uart]);
-    */
-    /*
-    // UART2
-    uart_isr_register(uart,
-                      ISR_uart2,   // CALLBACK a asignar
-                      NULL,
-                      ESP_INTR_FLAG_IRAM,
-                      &uart_isr_handle[uart]);
-    */                  
 }
 
 // IRAM_ATTR obligatorio si usás ESP_INTR_FLAG_IRAM
@@ -190,6 +153,51 @@ void IRAM_ATTR ISR_uart0(void *arg)
         // En OVF hay que hacer reset del FIFO:
         uart_ll_rxfifo_rst(n);
     }
+}
+
+// Registro del ISR (la parte más diferente)
+// En el LPC845 el ISR es un símbolo débil que el linker resuelve automáticamente. 
+// En ESP-IDF hay que registrarlo explícitamente, y hay una restricción importante: 
+// uart_isr_register() no puede usarse si antes llamaste a uart_driver_install() 
+// — son mutuamente excluyentes.
+void uart_enable_irq(uart_handle_t uart)
+{
+    // Habilito RX interrupts a nivel de periférico
+    // (RXFIFO_FULL + RXFIFO_TOUT, análogo a kUSART_RxReadyInterruptEnable)
+    
+    // El primer argumento de todas las funciones uart_ll_* es uart_dev_t *hw: 
+    // en la práctica se usa &UART0, &UART1 o &UART2 (instancias globales del SDK).
+    uart_dev_t *uart_n = get_uart_instance(uart);
+
+    uart_ll_ena_intr_mask(uart_n,
+        UART_INTR_RXFIFO_FULL | UART_INTR_RXFIFO_TOUT);
+
+    // Registro ISR + habilito en el controlador de interrupciones del Xtensa
+    // Análogo a NVIC_EnableIRQ(USART0_IRQn)
+    // ESP_INTR_FLAG_IRAM → handler en IRAM, seguro ante cache miss de flash
+    
+    // UART0
+    esp_intr_alloc(uart_intr_src[uart],   // fuente: ETS_UART0_INTR_SOURCE etc.
+                    ESP_INTR_FLAG_IRAM,    // handler en IRAM
+                    ISR_uart0,             // tu callback
+                    NULL,                  // arg → void *arg del callback
+                    &uart_isr_handle[uart]);
+    /*
+    // UART1
+    uart_isr_register(uart,
+                      ISR_uart1,   // CALLBACK a asignar
+                      NULL,
+                      ESP_INTR_FLAG_IRAM,
+                      &uart_isr_handle[uart]);
+    */
+    /*
+    // UART2
+    uart_isr_register(uart,
+                      ISR_uart2,   // CALLBACK a asignar
+                      NULL,
+                      ESP_INTR_FLAG_IRAM,
+                      &uart_isr_handle[uart]);
+    */                  
 }
 
 uint8_t inline uart_new_line(void)

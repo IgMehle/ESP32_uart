@@ -3,3 +3,21 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# --- PlatformIO ---
+# Archivos de compilación (.elf, .bin, objetos) y librerías descargadas
+.pioenvs/
+.piolibdeps/
+.clang_complete
+.gcc-flags.json
+
+# --- ESP-IDF / Kconfig ---
+# Archivos de configuración autogenerados por la compilación de ESP-IDF
+sdkconfig
+sdkconfig.*
+!sdkconfig.defaults
+
+# --- VS Code ---
+# Configuración local de usuario e historial del editor
+.vscode/.browserslistrc
+.vscode/settings.json
