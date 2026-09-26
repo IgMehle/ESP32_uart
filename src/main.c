@@ -1,358 +1,179 @@
-#include "driver/uart.h"   // uart_isr_register, uart_enable_tx_intr, etc.
-#include "hal/uart_ll.h"   // uart_ll_*, uart_dev_t
-#include "soc/uart_struct.h" // UART0, UART1, UART2
-#include "esp_intr_alloc.h"
-#include "soc/interrupts.h"    // ETS_UARTn_INTR_SOURCE
+/*
+ * ------------------------------------------------
+ * uart_esp32_sdk.c — Versión usando el driver de alto nivel de ESP-IDF
+ * ------------------------------------------------
+ * Comparación directa con la versión de bajo nivel (uart_ll_* + ISR manual):
+ *
+ * ANTES (bajo nivel)                            AHORA (driver de alto nivel)
+ * --------------------------------------------  --------------------------------------------
+ * ring_buffer_t rx_buffer / tx_buffer            Ring buffers internos del driver (RX y TX)
+ * uart_isr_register() + ISR_uart0()              uart_driver_install() + cola de eventos
+ * flag_new_line + parseo manual de '\r'/'\n'     UART_PATTERN_DET (el hardware busca el patrón)
+ * uart_getc() / buffer_pop()                     uart_read_bytes()
+ * uart_write() + habilitar IRQ de TX a mano      uart_write_bytes() (usa el buffer del driver)
+ * while(1) haciendo polling de uart_new_line()   Tarea FreeRTOS bloqueada en xQueueReceive()
+ * Chequeo manual de RXFIFO_OVF en el ISR         Evento UART_FIFO_OVF / UART_BUFFER_FULL
+ *
+ * Nota: uart_isr_register() y uart_driver_install() son mutuamente excluyentes.
+ * Acá usamos EXCLUSIVAMENTE la API de alto nivel: no se toca uart_ll_* en ningún lado.
+ * ------------------------------------------------
+ */
+
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/uart.h"
+#include "esp_log.h"
 
 // PINOUT
-#define UART0_TX_PIN  17
-#define UART0_RX_PIN  16
+// IMPORTANTE: se usa UART2 y NO UART0. UART0 está cableado por hardware a los
+// pines GPIO1 (TX) / GPIO3 (RX), que van al CP2102/CH340 de la placa para
+// flasheo y consola de debug (logs del IDF, idf.py monitor). Remapear UART0
+// a otros pines por software no mueve el chip USB-serie: seguís perdiendo la
+// consola porque el periférico deja de hablar por 1/3.
+// UART1/UART2 no tienen pines fijos y se asignan libremente por matriz de GPIO.
+// Nota: en módulos WROVER (con PSRAM), evitar GPIO16/17 (bus SPI de la PSRAM);
+// en WROOM están libres.
+#define UART_PORT       UART_NUM_2
+#define UART_RX_PIN     16
+#define UART_TX_PIN     17
+
+// BUFFERS (los administra el driver, ya no son ring_buffer_t propios)
+#define UART_RX_BUF_SIZE    1024
+#define UART_TX_BUF_SIZE    1024
+#define UART_QUEUE_SIZE     20
+#define UART_LINE_BUF_SIZE  128
+
+// Carácter que marca fin de línea (equivalente conceptual a tu flag_new_line)
+#define LINE_END_CHAR   '\n'
+
+static const char *TAG = "uart_sdk";
+static QueueHandle_t uart_queue;
+static const char PROMPT[] = ">> ";
 
 // ------------------------------------------------
-// my_uart.h
-// ------------------------------------------------
-// BUFFER SIZE
-#define UART_BUFFER_SIZE	64
-#define RING_BF_MASK		(UART_BUFFER_SIZE - 1)
-
-// UART HANDLE
-// UART_NUM_0, UART_NUM_1, UART_NUM_2
-typedef uart_port_t uart_handle_t;
-
-// UARTS LIST
-// typedef enum uarts {
-// 	UART0,
-// 	UART1,
-// 	UART2
-// } n_uart_t;
-
-// RING BUFFER
-typedef struct {
-	char bf[UART_BUFFER_SIZE];
-	uint8_t head;
-	uint8_t tail;
-	//uint8_t count;
-} ring_buffer_t;
-
 // INIT
-
-/// @brief Funcion para inicializar la UART con baudrate como parametro (los pines se definen por tags)
-/// 
-/// #define UARTn_TX_PIN, UARTn_RX_PIN, UARTn_RTS_PIN, UARTn_CTS_PIN
-/// @param uart UART_NUM_0, UART_NUM_1, UART_NUM_2
-/// @param baudrate Baudrate
-void uart_init(uart_handle_t uart, uint32_t baudrate);
-
-// void uart_enable_irq(uart_handle_t uart, n_uart_t n);
-/// @brief Registro del callback como ISR
-/// @param uart UART_NUM_0, UART_NUM_1, UART_NUM_2
-void uart_enable_irq(uart_handle_t uart);
-
-// READ
-uint8_t uart_new_line(void);
-uint8_t uart_getc(void);
-
-// WRITE
-void uart_write_blocking(uart_handle_t uart, const char *ptr);
-void uart_write(uart_handle_t uart, char *bf);
-
-// RING BUFFERS
-void buffer_push(volatile ring_buffer_t *rb, char c);
-char buffer_pop(volatile ring_buffer_t *rb);
-// Teraterm manda 0x08 (ASCII BS).
-// Algunos terminales mandan 0x7F (DEL).
-// Conviene manejar los dos:
-uint8_t buffer_unpush(volatile ring_buffer_t *rb);
-
-// GET LL UART INSTANCE
-static inline uart_dev_t *get_uart_instance(uart_handle_t uart);
 // ------------------------------------------------
-
-// ------------------------------------------------
-// my_uart.c
-// ------------------------------------------------
-// VARIABLES DE LA LIBRERIA
-volatile ring_buffer_t rx_buffer;
-volatile ring_buffer_t tx_buffer;
-volatile uint8_t flag_new_line = 0;
-
-// Handle de las ISR
-//static intr_handle_t uart0_isr_handle;
-//static intr_handle_t uart1_isr_handle;
-//static intr_handle_t uart2_isr_handle;
-static intr_handle_t uart_isr_handle[3];
-
-static const int uart_intr_src[] = {
-    ETS_UART0_INTR_SOURCE,   // [0]
-    ETS_UART1_INTR_SOURCE,   // [1]
-    ETS_UART2_INTR_SOURCE    // [2]
-};
-
-// CALLBACK ISR
-//void IRAM_ATTR ISR_uart0(void *arg);
-
-void uart_init(uart_handle_t uart, uint32_t baudrate)
+static void uart_init(uart_port_t uart, uint32_t baudrate)
 {
-    // config de UART
     uart_config_t config = {
         .baud_rate  = baudrate,
         .data_bits  = UART_DATA_8_BITS,
         .parity     = UART_PARITY_DISABLE,
         .stop_bits  = UART_STOP_BITS_1,
         .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,   // análogo a CLOCK_GetFreq()
+        .source_clk = UART_SCLK_DEFAULT,
     };
-    uart_param_config(uart, &config);
-    // mapeo GPIO a signals de la UART
-    uart_set_pin(uart, UART0_TX_PIN, UART0_RX_PIN,
-                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    ESP_ERROR_CHECK(uart_param_config(uart, &config));
+    ESP_ERROR_CHECK(uart_set_pin(uart, UART_TX_PIN, UART_RX_PIN,
+                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+
+    // Reemplaza TODO tu bloque de ring buffers propios + uart_isr_register():
+    // el driver reserva sus propios buffers internos y registra su propio ISR.
+    ESP_ERROR_CHECK(uart_driver_install(uart, UART_RX_BUF_SIZE, UART_TX_BUF_SIZE,
+                                         UART_QUEUE_SIZE, &uart_queue, 0));
+
+    // Reemplaza tu flag_new_line + parseo manual de CR/LF dentro del ISR:
+    // el hardware busca LINE_END_CHAR solo y avisa por la cola de eventos.
+    ESP_ERROR_CHECK(uart_enable_pattern_det_baud_intr(uart, LINE_END_CHAR,
+                                                       /*chr_num=*/1,
+                                                       /*chr_tout=*/9, 0, 0));
+    ESP_ERROR_CHECK(uart_pattern_queue_reset(uart, UART_QUEUE_SIZE));
 }
 
-// IRAM_ATTR obligatorio si usás ESP_INTR_FLAG_IRAM
-
-void IRAM_ATTR ISR_uart0(void *arg)
+// ------------------------------------------------
+// WRITE (bloqueante hasta que entra al buffer de TX del driver;
+// ya no hace falta un ring buffer de TX propio ni habilitar IRQ a mano)
+// ------------------------------------------------
+static inline void uart_write(uart_port_t uart, const char *str)
 {
-    uart_dev_t *n = &UART0;
-    uint32_t status = uart_ll_get_intsts_mask(n);
+    uart_write_bytes(uart, str, strlen(str));
+}
 
-    // --- RX: FIFO lleno O timeout ---
-    if (status & (UART_INTR_RXFIFO_FULL | UART_INTR_RXFIFO_TOUT)) {
+// ------------------------------------------------
+// TAREA que reemplaza tu while(1) + polling de uart_new_line()
+// ------------------------------------------------
+static void uart_event_task(void *arg)
+{
+    uart_event_t event;
+    char line_buf[UART_LINE_BUF_SIZE];
 
-        // Dreno TODO el FIFO (diferencia clave vs LPC845)
-        uint32_t rx_len = uart_ll_get_rxfifo_len(n);
-        while (rx_len--) {
-            uint8_t c;
-            uart_ll_read_rxfifo(n, &c, 1);   // análogo a USART_ReadByte()
-            // ... misma lógica de CR/LF/BS/echo que tenés ...
-            buffer_push(&rx_buffer, c);
+    uart_write(UART_PORT, PROMPT);
+
+    for (;;) {
+        // Bloquea la tarea hasta que el driver reporte un evento: sin polling.
+        if (xQueueReceive(uart_queue, &event, portMAX_DELAY) != pdTRUE) {
+            continue;
         }
-        uart_ll_clr_intsts_mask(n,
-            UART_INTR_RXFIFO_FULL | UART_INTR_RXFIFO_TOUT);
-    }
 
-    // --- TX: FIFO vacío ---
-    if (status & UART_INTR_TXFIFO_EMPTY) {
-        uint32_t tx_free = uart_ll_get_txfifo_len(n);  // espacio libre
+        switch (event.type) {
 
-        while (tx_free--) {
-            char c = buffer_pop(&tx_buffer);
-            if (!c) {
-                // No hay más datos: deshabilito IRQ de TX
-                uart_disable_tx_intr(UART_NUM_0);       // análogo a USART_DisableInterrupts
+        case UART_PATTERN_DET: {
+            // Posición del '\n' dentro del ring buffer interno del driver
+            int pos = uart_pattern_pop_pos(UART_PORT);
+            if (pos == -1) {
+                // La cola de patrones se llenó y el driver perdió la posición:
+                // vaciamos el buffer para no quedar desalineados.
+                uart_flush_input(UART_PORT);
                 break;
             }
-            uart_ll_write_txfifo(n, (uint8_t*)&c, 1); // análogo a USART_WriteByte()
+
+            int len = uart_read_bytes(UART_PORT, (uint8_t *)line_buf,
+                                       pos, pdMS_TO_TICKS(100));
+            line_buf[len] = '\0';
+
+            // Descarto el carácter de fin de línea que quedó en el buffer
+            uint8_t discard;
+            uart_read_bytes(UART_PORT, &discard, 1, pdMS_TO_TICKS(100));
+
+            // Si el terminal manda CRLF, saco el '\r' final
+            if (len > 0 && line_buf[len - 1] == '\r') {
+                line_buf[len - 1] = '\0';
+            }
+
+            uart_write(UART_PORT, "\r\n");
+
+            if (line_buf[0] != '\0') {
+                if (strcmp(line_buf, "ping") == 0) {
+                    uart_write(UART_PORT, "< PONG\r\n");
+                } else {
+                    uart_write(UART_PORT, "< NACK\r\n");
+                }
+            }
+
+            uart_write(UART_PORT, PROMPT);
+            break;
         }
-        uart_ll_clr_intsts_mask(n, UART_INTR_TXFIFO_EMPTY);
+
+        case UART_FIFO_OVF:
+        case UART_BUFFER_FULL:
+            // Equivalente a tu chequeo manual de RXFIFO_OVF en el ISR: acá el
+            // driver ya reseteó el FIFO de hardware, nosotros solo vaciamos el
+            // buffer lógico y resincronizamos la detección de patrón.
+            ESP_LOGW(TAG, "Overflow de RX, reseteando buffers");
+            uart_flush_input(UART_PORT);
+            xQueueReset(uart_queue);
+            uart_pattern_queue_reset(UART_PORT, UART_QUEUE_SIZE);
+            break;
+
+        case UART_FRAME_ERR:
+        case UART_PARITY_ERR:
+            ESP_LOGW(TAG, "Error de trama/paridad");
+            break;
+
+        default:
+            // UART_DATA llega también mientras se completa la línea, pero como
+            // procesamos por UART_PATTERN_DET, lo ignoramos acá.
+            break;
+        }
     }
-
-    // --- Errores ---
-    if (status & (UART_INTR_FRAM_ERR | UART_INTR_PARITY_ERR | UART_INTR_RXFIFO_OVF)) {
-        uart_ll_clr_intsts_mask(n,
-            UART_INTR_FRAM_ERR | UART_INTR_PARITY_ERR | UART_INTR_RXFIFO_OVF);
-        // En OVF hay que hacer reset del FIFO:
-        uart_ll_rxfifo_rst(n);
-    }
 }
 
-// Registro del ISR (la parte más diferente)
-// En el LPC845 el ISR es un símbolo débil que el linker resuelve automáticamente. 
-// En ESP-IDF hay que registrarlo explícitamente, y hay una restricción importante: 
-// uart_isr_register() no puede usarse si antes llamaste a uart_driver_install() 
-// — son mutuamente excluyentes.
-void uart_enable_irq(uart_handle_t uart)
-{
-    // Habilito RX interrupts a nivel de periférico
-    // (RXFIFO_FULL + RXFIFO_TOUT, análogo a kUSART_RxReadyInterruptEnable)
-    
-    // El primer argumento de todas las funciones uart_ll_* es uart_dev_t *hw: 
-    // en la práctica se usa &UART0, &UART1 o &UART2 (instancias globales del SDK).
-    uart_dev_t *uart_n = get_uart_instance(uart);
-
-    uart_ll_ena_intr_mask(uart_n,
-        UART_INTR_RXFIFO_FULL | UART_INTR_RXFIFO_TOUT);
-
-    // Registro ISR + habilito en el controlador de interrupciones del Xtensa
-    // Análogo a NVIC_EnableIRQ(USART0_IRQn)
-    // ESP_INTR_FLAG_IRAM → handler en IRAM, seguro ante cache miss de flash
-    
-    // UART0
-    esp_intr_alloc(uart_intr_src[uart],   // fuente: ETS_UART0_INTR_SOURCE etc.
-                    ESP_INTR_FLAG_IRAM,    // handler en IRAM
-                    ISR_uart0,             // tu callback
-                    NULL,                  // arg → void *arg del callback
-                    &uart_isr_handle[uart]);
-    /*
-    // UART1
-    uart_isr_register(uart,
-                      ISR_uart1,   // CALLBACK a asignar
-                      NULL,
-                      ESP_INTR_FLAG_IRAM,
-                      &uart_isr_handle[uart]);
-    */
-    /*
-    // UART2
-    uart_isr_register(uart,
-                      ISR_uart2,   // CALLBACK a asignar
-                      NULL,
-                      ESP_INTR_FLAG_IRAM,
-                      &uart_isr_handle[uart]);
-    */                  
-}
-
-uint8_t inline uart_new_line(void)
-{
-	if (flag_new_line) {
-		flag_new_line = 0;
-		return 1;
-	}
-	else return 0;
-}
-
-uint8_t uart_getc(void)
-{
-	return buffer_pop(&rx_buffer);
-}
-
-void uart_write_blocking(uart_handle_t uart, const char *ptr)
-{
-    uart_dev_t *n = get_uart_instance(uart);
-
-    while (*ptr != '\0') {
-        // Espera espacio libre en FIFO TX
-        // Análogo a: while (!(flags & kUSART_TxReady))
-        // SOC_UART_FIFO_LEN = 128 bytes (ESP32)
-        while (uart_ll_get_txfifo_len(n) >= SOC_UART_FIFO_LEN);
-
-        // Escribe 1 byte al FIFO
-        // Análogo a: USART_WriteByte(uart, *ptr)
-        uart_ll_write_txfifo(n, (const uint8_t *)ptr, 1);
-        ptr++;
-    }
-
-    // Espera que el último byte salió completo del shift register
-    // Análogo a: while (!(flags & kUSART_TxIdleFlag))
-    while (!uart_ll_is_tx_idle(n));
-    // Nota: uart_ll_get_txfifo_len() devuelve bytes usados en el FIFO 
-    // (al revés de lo que el nombre sugiere). 
-    // Por eso la condición es >= SOC_UART_FIFO_LEN y no == 0.
-}
-
-/* uart_write()
-La diferencia conceptual está en kUSART_TxReadyInterruptEnable. 
-En el LPC845, esa IRQ dispara cuando el registro de 1 byte está listo. 
-En el ESP32 es UART_INTR_TXFIFO_EMPTY con un umbral (thresh):
-    thresh = 0 → interrupt dispara cuando el FIFO tiene ≤ 0 bytes, o sea cuando está vacío
-    Si el FIFO ya está vacío al momento de uart_enable_tx_intr(), 
-    la IRQ dispara inmediatamente → mismo kick-start que en el LPC845
-Y en el ISR, la contraparte uart_disable_tx_intr() reemplaza a USART_DisableInterrupts().
-*/
-void uart_write(uart_handle_t uart, char *ptr)
-{
-    // Copia al ring buffer — idéntico al LPC845
-    while (*ptr != '\0') {
-        buffer_push(&tx_buffer, *ptr);
-        ptr++;
-    }
-
-    // Habilito TX IRQ
-    // Análogo a: USART_EnableInterrupts(uart, kUSART_TxReadyInterruptEnable)
-    // thresh=0 → dispara cuando FIFO vacío → si ya está vacío, dispara ahora
-    uart_enable_tx_intr(uart, /*enable=*/1, /*thresh=*/0);
-}
-
-void buffer_push(volatile ring_buffer_t *rb, char c)
-{
-	// calculo la posicion del nuevo head
-	uint8_t next_head = (rb->head + 1) & RING_BF_MASK;
-	// uint8_t next_head = (rb->head + 1) % UART_BUFFER_SIZE;
-	// si next apunta a tail, el buffer esta lleno
-	if (next_head == rb->tail) {
-		// overflow
-		return;
-	}
-	// copio caracter
-	rb->bf[rb->head] = c;
-	// actualizo head
-	rb->head = next_head;
-	return;
-}
-
-char buffer_pop(volatile ring_buffer_t *rb)
-{
-	// si la queue esta vacia retorno caracter nulo
-	if (rb->tail == rb->head) return '\0';
-	// leo caracter
-	char c = rb->bf[rb->tail];
-	// calculo nueva posicion de tail
-	rb->tail = (rb->tail + 1) & RING_BF_MASK;
-	//rb->tail = (rb->tail + 1) % UART_BUFFER_SIZE;
-	// retorno caracter leido
-	return c;
-}
-
-// Retorna 1 si había algo para borrar, 0 si el buffer estaba vacío
-uint8_t buffer_unpush(volatile ring_buffer_t *rb)
-{
-    if (rb->head == rb->tail) return 0;  // nada que borrar
-    rb->head = (rb->head - 1) & RING_BF_MASK;
-    // rb->head = (rb->head - 1) % UART_BUFFER_SIZE;
-    return 1;
-}
-
-// Helper interno - devuelve la uart instance para las funciones uart_ll_()
-static inline uart_dev_t *get_uart_instance(uart_handle_t uart)
-{
-    // Equivalente al puntero USART_Type* del LPC845
-    static uart_dev_t *uart_map[] = {&UART0, &UART1, &UART2};
-    return uart_map[uart];
-}
 // ------------------------------------------------
-
-void app_main() 
+void app_main(void)
 {
-    // Mapeo pines de UART y configuro
-    uart_init(0, 9600);
-
-    char c = 0;
-	uint8_t i = 0;
-	char bf[UART_BUFFER_SIZE];
-	char prompt[] = ">> ";
-	uart_write(0, prompt);
-
-    // Habilito IRQ de RX
-    uart_enable_irq(0);
-
-    // LOOP DE EJECUCION
-    while (1) {
-        // Chequeo si termine de recibir una linea
-		if (uart_new_line()) {
-			// terminacion de linea CRLF
-			uart_write(0, "\r\n");
-
-			// Copio rx_buffer a buffer local
-			i = 0;
-			// lectura inicial
-			c = uart_getc();
-			while (c) {
-				// copio caracter
-				bf[i] = c;
-				i++;
-				// vuelvo a leer
-				c = uart_getc();
-			}
-			// aseguro terminacion de string
-			bf[i] = '\0';
-
-			if (bf[0] != '\0') {
-				// Comparo y escribo en uart
-				if (strcmp(bf, "ping") == 0) {
-					uart_write(0, "< PONG\r\n");
-				}
-				else uart_write(0, "< NACK\r\n");
-			}
-			// escribo prompt
-			uart_write(0, prompt);
-		}
-    }
+    uart_init(UART_PORT, 115200);
+    xTaskCreate(uart_event_task, "uart_event_task", 4096, NULL, 12, NULL);
 }
